@@ -1,3 +1,0 @@
-kobert_state_dict2.pth filter=lfs diff=lfs merge=lfs -text
-kobert_state_dict4.pth filter=lfs diff=lfs merge=lfs -text
-kobert_state_dict7.pth filter=lfs diff=lfs merge=lfs -text
