@@ -178,4 +178,4 @@ pyrightconfig.json
 temp_files
 kobert.pkl
 .DS_Store
-
+echo "*.pth"
