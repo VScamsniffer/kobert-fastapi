@@ -5,30 +5,51 @@ from transformers import BertModel, BertTokenizer
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import os
-from kobert_tokenizer import KoBERTTokenizer
 from kobert.pytorch_kobert import get_pytorch_kobert_model
 import torch.nn as nn
 import whisper
 from pydub import AudioSegment
-from pydub.utils import which
+from fastapi.middleware.cors import CORSMiddleware
 import logging
-from typing import Optional, List
+from typing import List
 from functools import lru_cache
 from collections import deque
 import asyncio
-from datetime import datetime, timedelta
-import asyncio
+from datetime import datetime
+from azure.storage.blob import BlobServiceClient
 
 app = FastAPI()
+
+# ✅ Azure 환경 변수 설정
+AZURE_ACCOUNT_NAME = os.getenv("AZURE_ACCOUNT_NAME")
+AZURE_ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
+AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "user_file")
+AZURE_CONNECTION_STRING = f"DefaultEndpointsProtocol=https;AccountName={AZURE_ACCOUNT_NAME};AccountKey={AZURE_ACCOUNT_KEY};EndpointSuffix=core.windows.net"
+
+# ✅ Azure Blob Storage 클라이언트 설정
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(AZURE_CONTAINER)
+
+
+
+# ✅ CORS 설정
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3001", "http://localhost:3000", "https://vscamsniffer.work.gd", "https://4.230.156.117:443"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 배치 처리를 위한 설정
+# ✅ 배치 처리 설정
 BATCH_SIZE = 32
-BATCH_TIMEOUT = 0.3  # 초
+BATCH_TIMEOUT = 0.3
 MAX_QUEUE_SIZE = 100
 
-# 배치 처리를 위한 큐와 이벤트
+# ✅ 배치 큐 및 이벤트
 class BatchProcessor:
     def __init__(self):
         self.queue = deque()
@@ -38,7 +59,7 @@ class BatchProcessor:
 
     async def add_to_queue(self, item):
         if len(self.queue) >= MAX_QUEUE_SIZE:
-            raise HTTPException(status_code=503, detail="서버가 너무 많은 요청을 처리중입니다")
+            raise HTTPException(status_code=503, detail="서버가 너무 많은 요청을 처리 중입니다.")
         
         future = asyncio.Future()
         self.queue.append((item, future))
@@ -50,17 +71,13 @@ class BatchProcessor:
 
     async def process_batch(self):
         self.processing = True
-        
         while self.queue:
             current_time = datetime.now()
-            
-            # 배치 크기나 시간 초과에 도달할 때까지 대기
             if (len(self.queue) < BATCH_SIZE and 
                 (current_time - self.last_process_time).total_seconds() < BATCH_TIMEOUT):
                 await asyncio.sleep(0.01)
                 continue
                 
-            # 현재 배치 처리
             batch = []
             futures = []
             batch_size = min(BATCH_SIZE, len(self.queue))
@@ -71,15 +88,11 @@ class BatchProcessor:
                 futures.append(future)
             
             try:
-                # 배치 처리 실행
                 results = await process_text_batch(batch)
-                
-                # 결과 반환
                 for future, result in zip(futures, results):
                     future.set_result(result)
                     
             except Exception as e:
-                # 에러 처리
                 for future in futures:
                     future.set_exception(e)
             
@@ -87,7 +100,7 @@ class BatchProcessor:
         
         self.processing = False
 
-# 기존 BERTClassifier 클래스는 동일하게 유지
+# ✅ BERT 모델 클래스 정의
 class BERTClassifier(nn.Module):
     def __init__(self, hidden_size=768, num_classes=2):
         super(BERTClassifier, self).__init__()
@@ -98,11 +111,11 @@ class BERTClassifier(nn.Module):
         _, pooled_output = self.bert(input_ids=token_ids, return_dict=False)
         return self.classifier(pooled_output)
 
-# 모델 초기화
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "kobert_state_dict2.pth")
+# ✅ 모델 초기화
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "kobert_state_dict4.pth")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-TEMP_DIR = os.path.join(os.getcwd(), "temp_files")
+TEMP_DIR = "/app/temp_files"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 @lru_cache(maxsize=1)
@@ -120,11 +133,9 @@ def load_models():
 model, tokenizer, whisper_model = load_models()
 batch_processor = BatchProcessor()
 
-# 배치 처리를 위한 함수
+# ✅ 배치 처리 함수
 async def process_text_batch(texts: List[str]) -> List[float]:
-    """배치로 텍스트 분석 처리"""
     try:
-        # 토큰화
         inputs = tokenizer(
             texts,
             padding=True,
@@ -132,19 +143,15 @@ async def process_text_batch(texts: List[str]) -> List[float]:
             max_length=512,
             return_tensors="pt"
         )
-        
-        # 디바이스로 이동
         inputs = {k: v.to(device) for k, v in inputs.items()}
         valid_lengths = torch.tensor([len(ids) for ids in inputs["input_ids"]]).to(device)
         segment_ids = torch.zeros_like(inputs["input_ids"]).to(device)
 
-        # 배치 추론
         with torch.no_grad():
             outputs = model(inputs["input_ids"], valid_lengths, segment_ids)
             probabilities = torch.sigmoid(outputs.squeeze(1)).cpu().numpy().tolist()
 
         return probabilities
-
     except Exception as e:
         logger.error(f"🚨 [ERROR] 배치 처리 중 오류 발생: {str(e)}")
         return [0.0] * len(texts)
@@ -161,37 +168,36 @@ async def upload_audio_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="지원되지 않는 파일 형식입니다.")
 
     try:
-        # 파일 처리
-        temp_filename = f"{os.urandom(8).hex()}{ext}"
-        temp_audio_path = os.path.join(TEMP_DIR, temp_filename)
+        unique_filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{file.filename}"
+        temp_audio_path = os.path.join(TEMP_DIR, unique_filename)
         
-        contents = await file.read()
+        # ✅ FastAPI 컨테이너 내부에 저장
         with open(temp_audio_path, "wb") as f:
-            f.write(contents)
+            f.write(await file.read())
 
-        # WAV 변환
-        wav_file_path = os.path.join(TEMP_DIR, f"{os.path.splitext(temp_filename)[0]}.wav")
-        if ext != '.wav':
-            logger.info(f"[🎙️ 변환] {ext} → WAV 변환 중...")
+        # ✅ Azure Storage에 업로드
+        blob_client = container_client.get_blob_client(f"user_file/{unique_filename}")
+        with open(temp_audio_path, "rb") as data:
+            blob_client.upload_blob(data, overwrite=True)
+
+        # ✅ WAV 변환 (초기화 포함)
+        wav_file_path = temp_audio_path  # 기본적으로 원본 파일을 사용
+        if ext != ".wav":
             audio = AudioSegment.from_file(temp_audio_path, format=ext[1:])
+            wav_file_path = os.path.join(TEMP_DIR, f"{os.path.splitext(unique_filename)[0]}.wav")
             audio.export(wav_file_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
-        else:
-            wav_file_path = temp_audio_path
 
-        # STT 수행
+        # ✅ STT 수행
         text = await audio_to_text(wav_file_path)
-        if isinstance(text, str) and text.startswith("Whisper 변환 실패"):
-            raise HTTPException(status_code=500, detail=text)
-
         logger.info(f"[분석할 텍스트]: {text}")
 
-        # 배치 처리 큐에 추가
+        # ✅ 배치 처리 큐에 추가
         probability = await batch_processor.add_to_queue(text)
 
-        # 임시 파일 정리
+        # ✅ 임시 파일 삭제
         try:
             os.remove(temp_audio_path)
-            if ext != '.wav':
+            if ext != ".wav" and os.path.exists(wav_file_path):
                 os.remove(wav_file_path)
         except Exception as e:
             logger.warning(f"임시 파일 삭제 실패: {e}")
@@ -199,11 +205,11 @@ async def upload_audio_file(file: UploadFile = File(...)):
         return {"probability": probability * 100, "text": text}
 
     except Exception as e:
-        logger.error(f"🚨 [ERROR] 업로드 중 오류 발생: {str(e)}")
+        logger.error(f"🚨 [ERROR] 업로드 중 오류 발생!: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 async def audio_to_text(wav_file_path: str) -> str:
-    """오디오 분석"""
     if not os.path.exists(wav_file_path):
         raise FileNotFoundError(f"File not found: {wav_file_path}")
 
@@ -211,33 +217,9 @@ async def audio_to_text(wav_file_path: str) -> str:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             app.state.thread_pool, 
-            lambda: whisper_model.transcribe(
-                wav_file_path,
-                fp16=False,
-                language='ko'
-            )
+            lambda: whisper_model.transcribe(wav_file_path, fp16=False, language='ko')
         )
         return result["text"]
     except Exception as e:
         logger.error(f"🚨 [오류] Whisper 변환 실패: {str(e)}")
         return f"Whisper 변환 실패: {str(e)}"
-
-@app.on_event("startup")
-async def startup_event():
-    """사이트 시작시 모델링 대기시키기"""
-    import concurrent.futures
-    app.state.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-    
-    # 더미데이터로 모델링 대기시키기
-    dummy_text = "안녕하세요"
-    await batch_processor.add_to_queue(dummy_text)
-    logger.info("Models warmed up successfully")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """스레드 정리"""
-    app.state.thread_pool.shutdown()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
