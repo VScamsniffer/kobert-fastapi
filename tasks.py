@@ -4,8 +4,8 @@ np.bool = bool
 import logging
 from celery_setting import celery_app
 import torch
+from transformers import BertModel
 from transformers import BertTokenizer
-from kobert.pytorch_kobert import get_pytorch_kobert_model
 import torch.nn as nn
 import whisper
 import torch
@@ -16,9 +16,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# Celery 설정
-REDIS_URL = "redis://localhost:6379/0"
-app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
 # 모델 로드
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "kobert_state_dict2.pth")
@@ -27,10 +24,10 @@ whisper_model = whisper.load_model("base", device=device)
 
 
 class BERTClassifier(nn.Module):
-    def __init__(self, hidden_size=768, num_classes=2):
+    def __init__(self, hidden_size=768, num_classes=1):
         super(BERTClassifier, self).__init__()
-        self.bert, _ = get_pytorch_kobert_model()
-        self.classifier = torch.nn.Linear(768, 1)
+        self.bert = BertModel.from_pretrained('skt/kobert-base-v1')
+        self.classifier = torch.nn.Linear(hidden_size, num_classes)
 
     def forward(self, token_ids, valid_length, segment_ids):
         _, pooled_output = self.bert(input_ids=token_ids, return_dict=False)
@@ -44,7 +41,7 @@ model.eval()
 
 tokenizer = BertTokenizer(vocab_file="tokenizer_vocab.txt", do_lower_case=False)
 
-@app.task
+@celery_app.task
 def predict_text(text):
     """텍스트를 받아서 확률 예측"""
     if not isinstance(text, str):  # text가 str인지 체크
@@ -71,30 +68,25 @@ def predict_text(text):
         outputs = model(inputs["input_ids"], valid_lengths, segment_ids)
         probabilities = torch.sigmoid(outputs.squeeze(1)).cpu().numpy().tolist()
     print(outputs)  # 출력값 확인
+    print(f"보이스피싱일 확률{probabilities}")
     return probabilities
 
 # 배치 사이즈 설정
 BATCH_SIZE = 32
 
-@app.task
+@celery_app.task
 def batch_predict_text(texts):
     """배치 텍스트를 받아서 확률 예측"""
-    batch_results = []
-
-    # Celery 작업을 비동기적으로 실행
-    from celery_setting import group
-
-    # predict_text 작업을 비동기적으로 호출
-    result = group(predict_text.s(text) for text in texts)  # predict_text를 비동기적으로 호출
-    results = result.apply_async()  # 실제 작업 실행
-    
-    # 결과 반환
-    batch_results = results.get()  # 결과를 기다림
-
-    return batch_results  # 배치 처리 후 결과 반환
+    # Use celery_app.group instead of importing group separately
+    tasks = [predict_text.s(text) for text in texts]
+    job = celery_app.group(tasks)
+    result = job.apply_async()
+    return result.get()
 
 
-@app.task
+
+
+@celery_app.task
 def transcribe_audio(wav_file_path: str) -> str:
     """Whisper STT 변환"""
     try:
@@ -105,4 +97,6 @@ def transcribe_audio(wav_file_path: str) -> str:
         )
         return result["text"]
     except Exception as e:
-        return f"Whisper 변환 실패: {str(e)}"
+        # 오류 발생 시 더 구체적인 에러 메시지를 출력
+        print(f"Whisper 변환 실패: {e}")
+        raise Exception(f"Whisper 변환 실패: {e}")
